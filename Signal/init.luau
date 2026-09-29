@@ -9,17 +9,24 @@ WHY:
 	(https://en.wikipedia.org/wiki/Publish%E2%80%93subscribe_pattern)
 
 
+
 NOTES:
-- Linked list based approach has been used to allow easy removes at abrupt indexes avoiding table.remove's element shift
+- Based on New luau type solver
+- Uses generics for IntelliSense and easy autofill
+- Tiny module making the code easy to read by anyone
+- Use variables and methods with Pascal naming scheme only, camel or snake cases are for internal work and should not be used unless you know exactly what you are doing
+- Uses circular doubly linked list based approach to allow O(1) disconnects at abrupt indexes.
+- All callers and waiters start as different threads at the same time (in order of their entrances), its upto the cpu scheduler to decide which one finishes first.
+- All callbacks and waiters are wrapped in pcall adding error handling, so error in one call doesn't affect the others
 
-
-TESTS:
-[PASSED] Checked for memory leaks
 
 
 UPDATES:
 - 07-09-2026
 	Minor changes and rearrangements for use in external editors
+- 29-09-2026
+	Fixed bug where the head connection disconnection
+	Removed inter connection link nullifying on DisconnectAll, GC can clear connections as soon as they are dereferenced
 ]]
 
 
@@ -28,47 +35,55 @@ UPDATES:
 local Threads = require(script.Parent:WaitForChild("Threads"))
 
 
+-- Connection type
+export type Connection<T... = ...any> = {
+	Connected: boolean,
+	Disconnect: (self: Connection<T...>) -> (),
+	_isOnce: boolean,
+	_thread: thread?,
+	_callback: ((T...) -> ())?,
+	_previous: Connection<T...>|Signal<T...>|nil,
+	_next: Connection<T...>|Signal<T...>|nil,
+	__index: Connection<T...>
+}
+
+
+-- Signal type
+export type Signal<T... = ...any> = {
+	Fire: (self: Signal<T...>, T...) -> (),
+	Connect: (self: Signal<T...>, callback: (T...) -> ()) -> Connection<T...>,
+	Once: (self: Signal<T...>, callback: (T...) -> ()) -> Connection<T...>,
+	Wait: (self: Signal<T...>) -> T...,
+	DisconnectAll: (self: Signal<T...>) -> (),
+	_next: Connection<T...>?,
+	_previous: Connection<T...>?,
+	__index: Signal<T...>
+}
+
+
 -- Every callback and waiter is wrapped in a Connection object
 local Connection = {} :: Connection
 Connection.__index = Connection
-
-
--- Connection type
-export type Connection<ParamsT... = ...any> = {
-	Disconnect: (self: Connection<ParamsT...>) -> (),
-	_isOnce: boolean,
-	_thread: thread?,
-	_callback: ((ParamsT...) -> ())?,
-	_previous: Connection<ParamsT...>?,
-	_next: Connection<ParamsT...>?,
-	__index: Connection<ParamsT...>
-}
 
 
 -- Disconnects a connection so it doesn't receive any further fires
 function Connection:Disconnect()
 
 
-	-- Fetch next and previous connections
-	local previousConnection = self._previous
-	local nextConnection = self._next
+	-- Update the connection's Connected flag
+	self.Connected = false
 
 
 	-- If previous exist, set its next node to the current's next
-	if previousConnection then
-		previousConnection._next = nextConnection
+	if self._previous then
+		self._previous._next = self._next
 	end
 
 
 	-- If next exist, set its previous node to the current's previous
-	if nextConnection then
-		nextConnection._previous = previousConnection
+	if self._next then
+		self._next._previous = self._previous
 	end
-
-
-	-- Dereference current's previous and next
-	self._next = nil
-	self._previous = nil
 end
 
 
@@ -77,38 +92,30 @@ local Signal = {} :: Signal
 Signal.__index = Signal
 
 
--- Signal type
-export type Signal<ParamsT... = ...any> = {
-	Fire: (self: Signal<ParamsT...>, ParamsT...) -> (),
-	Connect: (self: Signal<ParamsT...>, callback: (ParamsT...) -> ()) -> Connection<ParamsT...>,
-	Once: (self: Signal<ParamsT...>, callback: (ParamsT...) -> ()) -> Connection<ParamsT...>,
-	Wait: (self: Signal<ParamsT...>) -> ParamsT...,
-	DisconnectAll: (self: Signal<ParamsT...>) -> (),
-	_nextConnection: Connection<ParamsT...>?,
-	_tailConnection: Connection<ParamsT...>?,
-	__index: Signal<ParamsT...>
-}
-
-
+-- Append a new connection to the signal
 local function addNewConnection(signal: Signal, connection: Connection)
 
 
-	-- Tail will be missing if no connection was ever added
-	if not signal._tailConnection then
-		signal._nextConnection = connection
-		signal._tailConnection = connection
-		return
+	connection.Connected = true
+
+
+	-- Add connection to head if no head exist
+	if not signal._next then
+		signal._next = connection
+		connection._previous = signal
 	end
 
 
-	-- Old tail
-	local oldTail = signal._tailConnection
+	-- If a tail exists, link that as self's previous
+	if signal._previous then
+		signal._previous._next = connection
+		connection._previous = signal._previous
+	end
 
 
-	-- Fix link changes
-	signal._tailConnection = connection
-	oldTail._next = connection
-	connection._previous = oldTail
+	-- Set new connection as the new tail
+	signal._previous = connection
+	connection._next = signal
 end
 
 
@@ -119,8 +126,7 @@ function Signal:Connect(callback)
 	-- Create a new connection
 	-- False isOnce says the connection should stay until it's manually disconnected
 	-- Save the provided callback to execute when a fire is received
-	local connection = setmetatable({}, Connection) :: Connection
-	connection._callback = callback
+	local connection = setmetatable({_callback = callback}, Connection) :: Connection
 
 
 	-- Insert connection at the end of connection list
@@ -139,9 +145,7 @@ function Signal:Once(callback)
 	-- Create a new connection
 	-- True isOnce says the connection should auto drop after it receives a fire
 	-- Save the provided callback to execute when a fire is received
-	local connection = setmetatable({}, Connection) :: Connection
-	connection._isOnce = true
-	connection._callback = callback
+	local connection = setmetatable({_isOnce = true, _callback = callback}, Connection) :: Connection
 
 
 	-- Insert connection at the end of connection list
@@ -159,9 +163,7 @@ function Signal:Wait()
 	-- Create a new connection
 	-- True isOnce says the connection should auto drop after it receives a fire
 	-- Save the current thread, for future resumption
-	local connection = setmetatable({}, Connection) :: Connection
-	connection._isOnce = true
-	connection._thread = coroutine.running()
+	local connection = setmetatable({_isOnce=true, _thread = coroutine.running()}, Connection) :: Connection
 
 
 	-- Insert connection at the end of connection list
@@ -179,24 +181,15 @@ function Signal:Fire(...)
 
 
 	-- Fetch the first connection
-	local connection = self._nextConnection
+	local connection = self._next
 
 
 	-- Traverse the linked list
-	while connection do
+	while connection and connection ~= self do
 
 
-		-- If waiter is a function, execute it via reusable threads
-		if connection._thread then
-			pcall(task.spawn, connection._thread, ...)
-
-
-		-- If waiter is a yielded thread, execute it via task.spawn
-		elseif connection._callback then
-			Threads.Spawn(connection._callback, ...)
-
-
-		end
+		-- Store the next connection
+		local nextConnection = connection._next
 
 
 		-- If connection was a once type, disconnect from the linked list
@@ -205,34 +198,43 @@ function Signal:Fire(...)
 		end
 
 
+		-- If waiter is a yielded thread, execute it via task.spawn
+		if connection._thread then
+			pcall(task.spawn, connection._thread, ...)
+
+
+		-- If waiter is a function, execute it via reusable threads
+		elseif connection._callback then
+			pcall(Threads.Spawn, connection._callback, ...)
+		end
+
+
 		-- Get the next connection
+		connection = nextConnection
+	end
+end
+
+
+-- Disconnect all connections from the signal
+function Signal:DisconnectAll()
+
+
+	-- Fetch the first connection
+	local connection = self._next
+
+
+	-- Nullify the first and last connection
+	self._next = nil
+	self._previous = nil
+
+
+	-- Traverse the linked list and mark everyone as disconnected
+	while connection and connection ~= self do
+		connection.Connected = false
 		connection = connection._next
 	end
 end
 
 
-function Signal:DisconnectAll()
-
-
-	local connection = self._nextConnection
-	self._nextConnection = nil
-	self._tailConnection = nil
-
-
-	-- Traverse the linked list
-	while connection do
-
-		local next = connection._next
-
-
-		connection._previous = nil
-		connection._next = nil
-
-		-- Get the next connection
-		connection = next
-	end
-end
-
-
 -- Create a new signal
-return function<ParamsT...>() return setmetatable({}, Signal) :: Signal<ParamsT...> end
+return function<T...>() return setmetatable({}, Signal) :: Signal<T...> end
