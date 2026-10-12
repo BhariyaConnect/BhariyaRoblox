@@ -22,6 +22,8 @@ UPDATES:
 - 06-09-2026
 	Minor changes and rearrangements for use in external editors
 	Make the function call safe using pcall
+- 11-10-2026
+	Added generic types to methods
 ]]
 
 
@@ -61,19 +63,19 @@ local Threads = {}
 
 
 -- Run a function immediately
-function Threads.Spawn(func, ...)
+function Threads.Spawn<T...>(func: (T...)->(), ...: T...)
 	return task.spawn(fetchThread(), func, ...)
 end
 
 
 -- Run a function after current frame
-function Threads.Defer(func, ...)
+function Threads.Defer<T...>(func: (T...)->(), ...: T...)
 	return task.defer(fetchThread(), func, ...)
 end
 
 
 -- Run a delayed function
-function Threads.Delay(duration, func, ...)
+function Threads.Delay<T...>(duration: number, func: (T...)->(), ...: T...)
 	return task.delay(duration, fetchThread(), func, ...)
 end
 
