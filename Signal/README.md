@@ -11,9 +11,9 @@
 **Class 2 According to [Gohan's Signal Certifications & Classes](https://devforum.roblox.com/t/signal-certifications-classes-guide/4263792)**
 ```
 --------------------------------------------------------------------------------------
-🎓 | TESTING: Signal         |  -  Server - Signal_Certifications:1990
+🎓 | TESTING: Signal         |
 --------------------------------------------------------------------------------------
-⚪ | Scheduler Certification |  -  Server - Signal_Certifications:2002
+⚪ | Scheduler Certification |
 --------------------------------------------------------------------------------------
 ☑ | Create                   | Baseline: 1  ▶ {...} | Results: 1  ▶ {...}
 ☑ | Connect                  | Baseline: 9  ▶ {...} | Results: 9  ▶ {...}
@@ -33,9 +33,9 @@
 ☑ | MultiSignalNested        | Baseline: 10  ▶ {...} | Results: 10  ▶ {...}
 ☑ | MultiSignalDisconnectAll | Baseline: 1  ▶ {...} | Results: 1  ▶ {...}
 --------------------------------------------------------------------------------------
-✅ | Scheduler Certified     |  -  Server - Signal_Certifications:127
+✅ | Scheduler Certified     | 
 --------------------------------------------------------------------------------------
-⚪ | Speed Certification     |  -  Server - Signal_Certifications:2035
+⚪ | Speed Certification     |
 --------------------------------------------------------------------------------------
 ☑ | Create         | -0.6μs  | Baseline: 0.7μs  ▶ {...} | Results: 0.0μs  ▶ {...}
 ☑ | Connect        | -0.7μs  | Baseline: 0.8μs  ▶ {...} | Results: 0.2μs  ▶ {...}
@@ -48,17 +48,17 @@
 ☑ | Disconnect     | -0.2μs  | Baseline: 0.3μs  ▶ {...} | Results: 0.1μs  ▶ {...}
 ☑ | DisconnectAll  | -13.3μs | Baseline: 14.2μs  ▶ {...} | Results: 0.9μs  ▶ {...}
 --------------------------------------------------------------------------------------
-✅ | Speed Certified         |  -  Server - Signal_Certifications:127
+✅ | Speed Certified         |
 --------------------------------------------------------------------------------------
-⚪ | Connected Certification |  -  Server - Signal_Certifications:2088
+⚪ | Connected Certification |
 --------------------------------------------------------------------------------------
 ☑ | Connect       | Baseline: 2  ▶ {...} | Results: 2  ▶ {...}
 ☑ | Once          | Baseline: 3  ▶ {...} | Results: 3  ▶ {...}
 ☑ | DisconnectAll | Baseline: 2  ▶ {...} | Results: 2  ▶ {...}
 --------------------------------------------------------------------------------------
-✅ | Connected Certified     |  -  Server - Signal_Certifications:127
+✅ | Connected Certified     |
 --------------------------------------------------------------------------------------
-⚪ | Snapshot Certification  |  -  Server - Signal_Certifications:2121
+⚪ | Snapshot Certification  |
 --------------------------------------------------------------------------------------
 ☑ | BasicOrdering     | Baseline: 1  ▶ {...} | Results: 1  ▶ {...}
 ☑ | Disconnect        | Baseline: 4  ▶ {...} | Results: 4  ▶ {...}
@@ -66,18 +66,18 @@
 ✖ | NestedConnections | Baseline: 3  ▶ {...} | Results: 4  ▶ {...}
 ✖ | ReentranceSafety  | Baseline: 6  ▶ {...} | Results: 6  ▶ {...}
 --------------------------------------------------------------------------------------
-❌ | NOT Snapshot Certified  |  -  Server - Signal_Certifications:127
+❌ | NOT Snapshot Certified  |
 --------------------------------------------------------------------------------------
-⚪ | Synchronous Certification |  -  Server - Signal_Certifications:2154
+⚪ | Synchronous Certification |
 --------------------------------------------------------------------------------------
 ☑ | Connect      | Baseline: 3  ▶ {...} | Results: 3  ▶ {...}
 ☑ | Wait_Modify  | Baseline: 2  ▶ {...} | Results: 2  ▶ {...}
 ☑ | Wait_Chained | Baseline: 1  ▶ {...} | Results: 1  ▶ {...}
 ☑ | Fire         | Baseline: 2  ▶ {...} | Results: 2  ▶ {...}
 --------------------------------------------------------------------------------------
-✅ | Synchronous Certified   |  -  Server - Signal_Certifications:127
+✅ | Synchronous Certified   |
 --------------------------------------------------------------------------------------
-⚪ | Order Certification     |  -  Server - Signal_Certifications:2187
+⚪ | Order Certification     |
 --------------------------------------------------------------------------------------
 ☑ | Connect    | Baseline: 2  ▶ {...} | Results: 2  ▶ {...}
 ☑ | Once       | Baseline: 2  ▶ {...} | Results: 2  ▶ {...}
@@ -85,8 +85,8 @@
 ☑ | Mixed      | Baseline: 12  ▶ {...} | Results: 12  ▶ {...}
 ☑ | Disconnect | Baseline: 10  ▶ {...} | Results: 10  ▶ {...}
 --------------------------------------------------------------------------------------
-✅ | Order Certified         |  -  Server - Signal_Certifications:127
+✅ | Order Certified         |
 --------------------------------------------------------------------------------------
-✅ | Signal: Class 2         |  -  Server - Signal_Certifications:2234
+✅ | Signal: Class 2         |
 --------------------------------------------------------------------------------------
 ```
