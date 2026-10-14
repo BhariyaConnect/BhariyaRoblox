@@ -4,8 +4,11 @@
 
 
 --[[
+Threads v1.0.0
+
+
 WHY:
-- Threads are expensive to create but cheaper to store in memory
+- Objects are expensive to create but cheaper to store in memory
 - Reduce CPU load caused by new thread creation
 
 
