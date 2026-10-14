@@ -4,7 +4,7 @@
 
 
 --[[
-Threads v1.0.0
+Thread v1.0.0
 
 
 WHY:
@@ -61,27 +61,27 @@ local function fetchThread()
 end
 
 
--- Threads is a constructor that offers methods to create new threads
-local Threads = {}
+-- Thread is a constructor that offers methods to create new threads
+local Thread = {}
 
 
 -- Run a function immediately
-function Threads.Spawn<T...>(func: (T...)->(), ...: T...)
+function Thread.Spawn<T...>(func: (T...)->(), ...: T...)
 	return task.spawn(fetchThread(), func, ...)
 end
 
 
 -- Run a function after current frame
-function Threads.Defer<T...>(func: (T...)->(), ...: T...)
+function Thread.Defer<T...>(func: (T...)->(), ...: T...)
 	return task.defer(fetchThread(), func, ...)
 end
 
 
 -- Run a delayed function
-function Threads.Delay<T...>(duration: number, func: (T...)->(), ...: T...)
+function Thread.Delay<T...>(duration: number, func: (T...)->(), ...: T...)
 	return task.delay(duration, fetchThread(), func, ...)
 end
 
 
 -- Return the table
-return table.freeze(Threads)
+return table.freeze(Thread)
