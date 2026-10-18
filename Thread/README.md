@@ -1,4 +1,4 @@
-# Threads
+# Thread v1.0.0
 - Based on New luau type solver.
 - Uses generics for IntelliSense and easy autofill.
 - Tiny module making the code easy to read by anyone.

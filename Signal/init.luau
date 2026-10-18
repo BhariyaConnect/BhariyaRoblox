@@ -3,7 +3,10 @@
 --!optimize 2
 
 
---[[ 
+--[[
+Signal v1.0.0
+
+
 WHY:
 - Pub-Sub functionality helps multiple functions or scripts to wait and get data at the same time.
 	(https://en.wikipedia.org/wiki/Publish%E2%80%93subscribe_pattern)
@@ -16,7 +19,7 @@ NOTES:
 - Tiny module making the code easy to read by anyone
 - Use variables and methods with Pascal naming scheme only, camel or snake cases are for internal work and should not be used unless you know exactly what you are doing
 - Uses circular doubly linked list based approach to allow O(1) disconnects at abrupt indexes.
-- All callers and waiters start as different threads at the same time (in order of their entrances), its upto the cpu scheduler to decide which one finishes first.
+- All callers and waiters start as different thread at the same time (in order of their entrances), its upto the cpu scheduler to decide which one finishes first.
 - All callbacks and waiters are wrapped in pcall adding error handling, so error in one call doesn't affect the others
 
 
@@ -30,9 +33,9 @@ UPDATES:
 ]]
 
 
--- Depends on my Threads Module
--- Replace usage with task.spawn and task.defer if threads module is not desired
-local Threads = require(script.Parent:WaitForChild("Threads"))
+-- Depends on my Thread Module
+-- Replace usage with task.spawn and task.defer if thread module is not desired
+local Thread = require(script.Parent:WaitForChild("Thread"))
 
 
 -- Connection type
@@ -203,9 +206,9 @@ function Signal:Fire(...)
 			pcall(task.spawn, connection._thread, ...)
 
 
-		-- If waiter is a function, execute it via reusable threads
+		-- If waiter is a function, execute it via reusable thread
 		elseif connection._callback then
-			pcall(Threads.Spawn, connection._callback, ...)
+			pcall(Thread.Spawn, connection._callback, ...)
 		end
 
 

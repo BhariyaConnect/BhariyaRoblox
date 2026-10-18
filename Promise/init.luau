@@ -4,6 +4,9 @@
 
 
 --[[
+Promise v1.0.0
+
+
 WHY:
 - To handle asynchronous operations, like fetching data from a server, without freezing the main thread
  	by providing a placeholder object for a value that will arrive in the future.
@@ -32,9 +35,9 @@ UPDATES:
 ]]
 
 
--- Depends on my Threads Module
--- Replace usage with task.spawn and task.defer if threads module is not desired
-local Threads = require(script.Parent:WaitForChild("Threads"))
+-- Depends on my Thread Module
+-- Replace usage with task.spawn and task.defer if thread module is not desired
+local Thread = require(script.Parent:WaitForChild("Thread"))
 
 
 -- Promise allows a function to execute and return a result in the future using yielding or callback based methods 
@@ -63,15 +66,15 @@ export type Promise<ResolveT... = ...any, RejectT... = ...any> = {
 function Promise:AndThen(onResolve, onReject)
 
 
-	-- Create the new chained promise
-	local chainedPromise = NewPromise(function(resolve, reject)
+	-- Create and return the new chained promise
+	return NewPromise(function(resolve, reject)
 
 
-	-- Function to process current promise if parent gets rejected
+		-- Function to process current promise if parent gets rejected
 		local function handleParentCompletion(successful: boolean, ...)
 
 
-		-- Switch based on success
+			-- Switch based on success
 			local passedCallback = if successful then onResolve else onReject
 			local chainCallback = if successful then resolve else reject
 
@@ -101,16 +104,13 @@ function Promise:AndThen(onResolve, onReject)
 
 		-- If parent promise already completed, simply execute the new promise's resolve/reject, else add them to current promise's callback list
 		if self._completed then
-			Threads.Spawn(handleParentCompletion, self._success, table.unpack(self._result))
+			Thread.Spawn(handleParentCompletion, self._success, table.unpack(self._result))
 			return
 		end
 
 
 		table.insert(self._waiters, handleParentCompletion)
 	end)
-
-
-	return chainedPromise
 end
 
 
@@ -128,7 +128,7 @@ end
 function Promise:Await()
 
 
--- If promise was already complete, simply return the already completed values with the success flag
+	-- If promise was already complete, simply return the already completed values with the success flag
 	if self._completed then
 		return self._success, table.unpack(self._result)
 	end
@@ -139,8 +139,7 @@ function Promise:Await()
 
 
 	-- Add the thread to the waiter list with a resume callback
-	table.insert(self._waiters, function(success: boolean, ...) task.spawn(currentThread, success, ...)
-	end)
+	table.insert(self._waiters, function(success: boolean, ...) task.spawn(currentThread, success, ...) end)
 
 
 	-- Yield the caller thread until promise completes
@@ -210,7 +209,7 @@ function NewPromise<ResolveT..., RejectT...>(executor: (resolve: (ResolveT...) -
 
 		-- Execute all callbacks in different threads
 		for _, callback in promise._waiters do
-			Threads.Spawn(callback, success, ...)
+			Thread.Spawn(callback, success, ...)
 		end
 
 
@@ -220,7 +219,7 @@ function NewPromise<ResolveT..., RejectT...>(executor: (resolve: (ResolveT...) -
 
 
 	-- Run the executor in a new thread
-	Threads.Spawn(function()
+	Thread.Spawn(function()
 
 
 		-- Pcall is used for safe execution, so executor errors are caught and passed as rejected promise

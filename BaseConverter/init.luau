@@ -3,6 +3,9 @@
 --!optimize 2
 
 --[[
+BaseConverter v1.0.0
+
+
 WHY:
 - Any storage form keeps data as string, taking more space for datatypes like numbers
 	"10000000" as Base10 is 8 bytes but the same converted to Base88 is "GC7o" which is only 4 bytes
@@ -42,7 +45,6 @@ local CHARACTER_SET = {
 
 -- Base of the encoded string value
 local BASE = #CHARACTER_SET
-print("Base converter initialised. Current base:", BASE)
 
 
 -- Reverse map
@@ -60,7 +62,7 @@ end
 function Encode(n: number)
 
 
--- No modulus loop is required if the number is zero
+	-- No modulus loop is required if the number is zero
 	if n == 0 then
 		return CHARACTER_SET[1]
 	end
@@ -95,7 +97,7 @@ end
 function Decode(s: string)
 
 
--- Final numeric value, start with 0
+	-- Final numeric value, start with 0
 	local value = 0
 
 
