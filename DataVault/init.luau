@@ -2,9 +2,24 @@
 --!native
 --!optimize 2
 
---[[
-DataVault v0.3.0
 
+--[[
+DataVault v1.0.0
+
+NOTE:
+
+DSData.__PUBLIC = {Player = 100}
+vault:UpdateData({"Player", "Coins"}, 50)
+This is a case of undesired behavior and should be avoided
+
+vault:GetPublicData().Score = 1234
+Modifying data without UpdateDataAsync should be avoided as it may give unpredictable save behavior
+
+Template should always be roblox serializable, no guarantee will be provided for invalid or non-serializable data
+
+2 Templates for the same vault (opened simultaneously) should be the same, no guarantees will be provided otherwise
+
+Stasis keeps vault usable as true, beware, rather always hold a reader to the vault till you think the vault might be used
 ]]
 
 
@@ -21,14 +36,10 @@ local Utils = require(script:WaitForChild('Utils'))
 local Constants = require(script:WaitForChild("Constants"))
 
 
-local Vault = {} :: Types.Vault
-Vault.__index = Vault
-
-
 local VaultsCount = State(0)
 local ServerShuttingDown = State(false)
-local MemoryStoreWorking = State(true)
-local DataStoreWorking = State(true)
+local LastMemoryStoreActionSuccess = State(true)
+local LastDataStoreActionSuccess = State(true)
 const ServerSession = HttpService:GenerateGUID(false)
 
 
@@ -41,9 +52,6 @@ end)
 local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean, template: DataT): Types.Vault<DataT>
 
 
-	local VaultOpentime = DateTime.now().UnixTimestampMillis
-
-
 	-- Fetch VaultsHolder
 	local vaultHolder = FetchVaultsHolder(dsName)
 
@@ -51,36 +59,43 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 	-- If vault already in server, return it blindly
 	local oldVault: Types.Vault<DataT> = vaultHolder.Vaults[vaultName]
 	if oldVault ~= nil then
-		-- If vault is opened in Visible mode, convert old vault to visible
-		if not hidden then oldVault.Hidden = hidden end
+
+
+		-- If current vault is opened in Visible mode, convert old vault to visible
+		if not hidden and oldVault.Hidden then oldVault:UpgradeToVisible() end
+
+
 		return oldVault
 	end
 
 
 	-- Else create a new vault
 	local vault = {Hidden=hidden} :: Types.Vault<DataT>
-	vaultHolder.Vaults[vaultName] = vault
-	VaultsCount:Update(VaultsCount.Current + 1)
+	local VaultSession = HttpService:GenerateGUID(false) -- Unique ID to find and track the vault session (will be used by other servers to talk to current server)
+
+
+	-- Dummy lock value
+	local LockData: Types.LockData = {VaultSession = VaultSession, ServerSession = ServerSession, LockedAt = 0}
+
+
+	-- Dummy ActivityData
+	local ActivityData = {
+		FirstLogIn = 0,
+		LastLogIn = 0,
+		LastLogOut = 0,
+	}
+
+	-- Dummy PublicData
+	local PublicData: DataT = {}
 
 
 	-- Vault parameters scoped to the function
-	local VaultSession = HttpService:GenerateGUID(false) -- Unique ID to find and track the vault session (will be used by other servers to talk to current server)
 	local VaultUsable = State(false) -- Vault starts with being unusable
 	local VaultState = State(Constants.VaultState.CREATED) -- Initial state of the vault is CREATED
-	local LockData: Types.LockData = {VaultSession = VaultSession, ServerSession = ServerSession, LockedAt = 0} -- Dummy lock value
-	local DSData: Types.DataStoreData = {
-		__PUBLIC={},
-		__ACTIVITY={
-			FirstLogIn = 0,
-			LastLogIn = 0,
-			LastLogOut = 0,
-		}
-	} -- Dummy DS data
 	local NextReaderId = 0 -- Each reader gets its own ID
 	local ActiveReaders: {number} = {} -- ALl the active readers
 	local DataUpdatedSignal:Signal.Signal<{string|number}, any> = Signal() -- Fired when any data field changes
-	--local VaultPrivateStateChanging = State(false) -- Sets when vault is ongoing cleanup or stasis convertion or reviving
-	local VaultPrivateState: "REVIVE"|"STASIS"|"CLEANUP" = "REVIVE" -- Saves vault's private state
+	local VaultPrivateState: Types.VaultPrivateState = Constants.VaultPrivateState.UNKNOWN -- Saves vault's private state
 
 
 	local AcquiresData = {
@@ -113,7 +128,7 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 		PrivateState = State(false),
 		MessagingChannel = State(false),
 		LockChange = State(false),
-		DataChange = State(false),
+		DataSave = State(false),
 		LockRenewLoop = false,
 		DataSaveLoop = false
 	}
@@ -121,7 +136,6 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 	local LastAchievedStates = {
 		Stasis = 0,
-
 	}
 
 
@@ -134,6 +148,8 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 	local MessagingChannel: RBXScriptConnection? -- Channel to be used for messaging
 	local LockAcquireThread: thread? -- Thread waiting for acquire response
+	local StasisWaitThread: thread? -- Thread waiting for stasis time to be over to clean up the vault
+	local ShutdownConnection: Signal.Connection<boolean>? -- Connection to wait for server shutdown
 
 
 	vault.Name = vaultName
@@ -144,8 +160,36 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 	vault.Locals = {}
 
 
-	function vault:GetPublicData() return DSData.__PUBLIC end
-	function vault:GetActivityData() return DSData.__ACTIVITY end
+	-- Returns the public data only if vault is usable
+	-- NOTE: Do not use this method without having an active reader for the vault first, else nil will be returned with a warning
+	function vault:GetPublicData()
+
+
+		-- Warn if vault is not in usable state
+		if not VaultUsable.Current then warn("[DataVault] Vault is in unusable state, hence it's public data should not be read") end
+
+
+		-- Finally return public data
+		return PublicData
+
+
+	end
+
+
+	-- Returns the activity data only if vault is usable
+	-- NOTE: Do not use this method without having an active reader for the vault first, else nil will be returned with a warning
+	function vault:GetActivityData()
+
+
+		-- Warn if vault is not in usable state
+		if not VaultUsable.Current then warn("[DataVault] Vault is in unusable state, hence it's activity data should not be read") end
+
+
+		-- Finally return activity data
+		return ActivityData
+
+
+	end
 
 
 	-- The function to update any field in the data
@@ -153,47 +197,92 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 	function vault:UpdateData(keys, value)
 
 
-		-- Starting point for finding the exact spot where data has to be changed
-		local pointer:{[string|number]:any} = DSData.__PUBLIC
+		-- Reject if vault is not in usable state
+		if not VaultUsable.Current then
 
 
-		-- Iterate through the keys and update the current pointer
-		for i, key in keys do
+			warn("Vault is in unusable state, hence it's data can not be modified")
+			return
 
 
-			-- Reached the last key, place value somehow
-			if i == #keys then
-
-
-				-- OPTIMISATION: If value is different, only then set the has changes flag
-				if value ~= pointer[key] then
-
-
-					-- Flag the vault as data changes ready
-					ReadyStates.DataChanges = true
-					pointer[key] = value
-				end
-			else
-
-
-				-- Create empty table if it doesn't exist
-				pointer[key] = pointer[key] or {}
-
-
-				-- Move the pointer to the next key
-				pointer = pointer[key]
-			end
 		end
 
 
-		-- Fire the signal for data update listeners
-		DataUpdatedSignal:Fire(keys, value)
+		-- Starting point for finding the exact spot where data has to be changed
+		local pointer:{[string|number]:any} = PublicData
+
+
+		-- Execute in pcall to prevent key and index errors blocking the data change lock forever
+		local success, reason = pcall(function()
+
+
+			-- Iterate through the keys and update the current pointer
+			for i, key in keys do
+
+
+				-- Reached the last key, place value somehow
+				if i == #keys then
+
+
+					-- OPTIMISATION: If value is different, only then set the has changes flag
+					if value ~= pointer[key] then
+
+
+						-- Flag the vault as data changes ready
+						pointer[key] = value
+						ReadyStates.DataChanges = true
+
+
+						-- Update last data change timestamp
+						LastActionCompletions.DataChange = DateTime.now().UnixTimestampMillis
+
+
+						-- Fire the signal for data update listeners
+						DataUpdatedSignal:Fire(keys, value)
+					end
+				else
+
+
+					-- Create empty table if it doesn't exist
+					pointer[key] = pointer[key] or {}
+
+
+					-- Move the pointer to the next key
+					pointer = pointer[key]
+				end
+			end
+		end)
+
+
+		-- Warn errors in data update
+		if not success then warn("[DataVault] UpdateData failed: ", reason) end
+
+
+	end
+
+
+	-- Upgrade a hidden vault to visible (update its activity data)
+	function vault:UpgradeToVisible()
+
+
+		-- If was visible already, ignore the call
+		if not vault.Hidden then return end
+		vault.Hidden = false
+
+
+		-- Set last login to now
+		ActivityData.LastLogIn = DateTime.now().UnixTimestampMillis
+
+
+		-- Flag vault data as dirty
+		ReadyStates.DataChanges = true
+
+
 	end
 
 
 	-- Release the lock or upgrade it to the newest acquirer
 	local function UpgradeOrReleaseLockAsync()
-		print("UpgradeOrReleaseLockAsync")
 
 
 		-- While another thread is modifying lock, wait
@@ -201,7 +290,7 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 		-- If vault went back to revived state while waiting, ignore the release call
-		if VaultPrivateState == "REVIVE" then return end
+		if VaultPrivateState == Constants.VaultPrivateState.REVIVE then return end
 
 
 		-- Prevent other threads from modifying lock
@@ -210,159 +299,177 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 		-- Will keep time for any action
 		local now: number
-		print("Releasing/Upgrading lock now")
 
 
-		-- Execute as pcall to prevent errors
-		local success = pcall(vaultHolder.LockMemoryStore.UpdateAsync, vaultHolder.LockMemoryStore, vaultName,
-			function(current: Types.LockData?): Types.LockData?
+		-- Attempts to save failure count
+		local attempts = 1
 
 
-				-- Mark action start time
-				now = DateTime.now().UnixTimestampMillis
+		-- Run the loop indefinitely as release is not an optional operation
+		while true do
 
 
-				-- If lock exists and owner is exactly current server and vault
-				if current ~= nil and current.ServerSession == ServerSession and current.VaultSession == VaultSession then
+			-- Execute as pcall to prevent errors
+			local success, value:Types.LockData? = pcall(vaultHolder.LockMemoryStore.UpdateAsync, vaultHolder.LockMemoryStore, vaultName,
+				function(current: Types.LockData?): Types.LockData?
 
 
-					-- Update with new lock with the acquirer's session
-					print("Lock released to:", AcquiresData.Received.ServerSession, AcquiresData.Received.VaultSession)
-					LockData.LockedAt = now
-					LockData.ServerSession = AcquiresData.Received.ServerSession
-					LockData.VaultSession = AcquiresData.Received.VaultSession
-					return LockData
+					-- Mark action start time
+					now = DateTime.now().UnixTimestampMillis
 
 
-				else -- For a different owner, mark lock as released, discard any unsaved changes and cleanup the vault (MIGHT LOSE DATA but impossible unless services are down)
+					-- If lock exists and owner is exactly current server and vault
+					if current ~= nil and current.ServerSession == ServerSession and current.VaultSession == VaultSession then
 
 
-					print("Lock already stolen or missing")
-					ReadyStates.DataChanges = false
-					ReadyStates.Lock = false
-					return nil
+						-- Update with new lock with the acquirer's session
+						return {LockedAt=now, ServerSession=AcquiresData.Received.ServerSession, VaultSession=AcquiresData.Received.VaultSession}
+
+
+					else -- For a different owner, mark lock as released, discard any unsaved changes and cleanup the vault (MIGHT LOSE DATA but impossible unless services are down)
+
+
+						ReadyStates.DataChanges = false
+						ReadyStates.Lock = false
+						return nil
+					end
+
+
+				end, Constants.LockExpiryDelayMS / 1000)
+
+
+			-- Flag MemoryStore service as working or failed
+			LastMemoryStoreActionSuccess:Update(success)
+
+
+			-- Mark when released will be sent
+			now = DateTime.now().UnixTimestampMillis
+
+
+			-- If lock upgrade/release was successful, send the release message
+			if success then
+
+
+				-- Lock was upgraded
+				if value ~= nil and value.VaultSession ~= "" then
+
+
+					-- Send released message to acquirer
+					local message: Types.InterVaultMessage = {ServerSession=ServerSession, VaultSession=VaultSession, SentAt=now, Reason=Constants.InterVaultMessageReason.RELEASED}
+					local mess_success, result = pcall(MessagingService.PublishAsync, MessagingService, value.ServerSession..":"..value.VaultSession, message)
+					if not mess_success then warn("[Retrying 3]", "MessagingService.PublishAsync Acquire response", result) end
+
+
 				end
-			end, Constants.MemoryStoreLockExpiryDelay / 1000)
 
 
-		-- Flag MemoryStore service as working
-		MemoryStoreWorking:Update(success)
+				-- Unlock lock modifications
+				OngoingActions.LockChange:Update(false)
+				break
 
 
-		-- Mark when released will be sent
-		now = DateTime.now().UnixTimestampMillis
+			else -- Upgrade/release failed
 
 
-		-- If lock upgrade/release was successful, send the release message
-		if success then
-			print("Released lock")
+				-- Wait and retry
+				warn("[Retrying 3] Attempt:", attempts, "MemoryStore.UpdateAsync (upgrade or release lock)")
+				task.wait(3)
 
 
-			-- Lock was upgraded
-			if LockData.VaultSession ~= "" then
+				-- Unlock lock modifications
+				OngoingActions.LockChange:Update(false)
 
 
-				-- Send message to acquirer
-				local message: Types.InterVaultMessage = {ServerSession=ServerSession, VaultSession=VaultSession, SentAt=now, Reason=Constants.InterVaultMessageReason.RELEASED}
-				pcall(MessagingService.PublishAsync, MessagingService, LockData.ServerSession..LockData.VaultSession, message)
-				print("Sent released message")
+				-- If failed and last updated is too old, stop retries
+				if now - LastActionCompletions.LockSave > Constants.LockStaleDelayMS then break end
+
+
+				-- Increment attempt
+				attempts += 1
+
+
 			end
-
-
-			-- Unlock lock modifications
-			OngoingActions.LockChange:Update(false)
-
-
-		else -- Upgrade/release failed
-
-
-			-- Wait and retry
-			warn("[Retrying 3]", "MemoryStore.UpdateAsync (upgrade or release lock)")
-			task.wait(3)
-
-
-			-- Unlock lock modifications
-			OngoingActions.LockChange:Update(false)
-
-
-			-- If failed and last updated is recent then retry
-			if now - LastActionCompletions.LockSave < Constants.MSLockStaleDelay then UpgradeOrReleaseLockAsync() end
 		end
 	end
 
 
 	-- Save data into datastore with the option to force save which forcefully saves ignoring last updated and last saved values
 	local function SaveDataAsync(forceSave: boolean)
-		print("SaveDataAsync")
 
 
-		-- While another thread is modifying the state of the data, wait
-		while OngoingActions.DataChange.Current do OngoingActions.DataChange.ChangeSignal:Wait() end
-
-
-		-- Action Start time
-		local now = DateTime.now().UnixTimestampMillis
-
-
-		-- If no unsaved changes after waiting, or last change was too recent and last save isn't too old, skip. But forceSave skips the time based skipping
-		if not ReadyStates.InitialData or not ReadyStates.DataChanges or ((not forceSave and now - LastActionCompletions.DataSave < 5000 and now - LastActionCompletions.DataSave < Constants.DSSaveLoopDelay)) then return end
-
-
-		-- Prevent other thread from modifying data
-		OngoingActions.DataChange:Update(true)
-
-
-		print("Save started now")
 		-- Count attempts for logging failure rates
 		local attempt = 1
 
 
 		-- Continue till there are changes yet to be saved
-		while ReadyStates.DataChanges and VaultState.Current ~= Constants.VaultState.RELEASED do
+		while ReadyStates.DataChanges do
 
 
-		-- Mark action start time
-			now = DateTime.now().UnixTimestampMillis
+			-- While another thread is saving data, wait
+			while OngoingActions.DataSave.Current do OngoingActions.DataSave.ChangeSignal:Wait() end
+
+
+			-- Action Start time
+			local now = DateTime.now().UnixTimestampMillis
+
+
+			-- If no unsaved changes after waiting, or last change was too recent and last save isn't too old, skip. But forceSave skips the time based skipping
+			if not ReadyStates.InitialData or not ReadyStates.DataChanges or ((not forceSave and now - LastActionCompletions.DataSave < 5000 and now - LastActionCompletions.DataSave < Constants.DataSaveLoopDelayMS)) then return end
+
+
+			-- Prevent other thread from modifying data
+			OngoingActions.DataSave:Update(true)
 
 
 			-- Flag available data changes as false
 			ReadyStates.DataChanges = false
 
 
-			-- SetAsync clones the last value pf the DSData, so further modification while it is saving acts as new changes
-			local success, result = pcall(vaultHolder.VaultDataStore.SetAsync, vaultHolder.VaultDataStore, vaultName, DSData)
+			-- SetAsync clones the last value of the data, so further modification while it is saving acts as new changes
+			local success, result = pcall(vaultHolder.VaultDataStore.SetAsync, vaultHolder.VaultDataStore, vaultName, {__ACTIVITY=ActivityData, __PUBLIC=PublicData})
 
 
 			-- Flag DataStore service as working or not
-			DataStoreWorking:Update(success)
+			LastDataStoreActionSuccess:Update(success)
 
 
 			-- If save failed, retry after delay
 			if not success then
 
 
-			-- Re-attach the unsaved changes flag
+				-- Re-attach the unsaved changes flag
 				ReadyStates.DataChanges = true
 				warn("[Retrying 5] Attempt:", attempt, "DataStore.SetAsync", result)
-				attempt += 1
 				task.wait(5)
+				attempt += 1
+
+
+				-- Allow other threads to take over the data save
+				OngoingActions.DataSave:Update(false)
 				continue
+
+
+			else
+
+
+				-- Allow other threads to take over the data save
+				OngoingActions.DataSave:Update(false)
+
+
 			end
 
 
 			-- Flag last save
 			LastActionCompletions.DataSave = now
+			break
 
 
-			-- Allow other threads to take over the data
-			OngoingActions.DataChange:Update(false)
 		end
 	end
 
 
 	-- Closes Messaging for the vault
 	local function CloseMessagingAsync()
-		print("CloseMessaging")
 
 
 		-- While another thread is modifying the state of the messaging, wait
@@ -370,35 +477,42 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 		-- If vault went back to revived state while waiting, ignore the release call
-		if VaultPrivateState == "REVIVE" then return end
+		if VaultPrivateState == Constants.VaultPrivateState.REVIVE then return end
 
 
 		-- Prevent other thread from modifying messaging
 		OngoingActions.MessagingChannel:Update(true)
 
 
-		print("Closing messaging now")
-
-
 		-- If Messaging channel exists, disconnect it
 		if MessagingChannel ~= nil then
+
+
 			MessagingChannel:Disconnect()
 			MessagingChannel = nil
 			ReadyStates.Messaging = false
-			print("Closed messaging")
+
+
 		end
 
 
 		-- Release the lock for messaging change
 		OngoingActions.MessagingChannel:Update(false)
+
+
 	end
 
 
 	-- Cleanup the vault from memory, leaving it totally unusable
 	-- It can not be recovered once cleaned up
 	local function CleanupAsync()
-		print("CleanupAsync")
-		VaultPrivateState = "CLEANUP"
+
+
+		-- Ignore run for already cleaned vault
+		if VaultPrivateState == Constants.VaultPrivateState.CLEANUP then return end
+
+
+		VaultPrivateState = Constants.VaultPrivateState.CLEANUP
 		LastAchievedStates.Cleanup = DateTime.now().UnixTimestampMillis
 
 
@@ -411,15 +525,31 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 		VaultUsable:Update(false)
 
 
+		-- Disconnect the shutdown connection
+		if ShutdownConnection ~= nil and ShutdownConnection.Connected then
+			ShutdownConnection:Disconnect()
+			ShutdownConnection = nil
+		end
+
+
+		-- Cancel the stasis wait thread
+		if StasisWaitThread ~= nil and coroutine.status(StasisWaitThread) == "suspended" then
+
+
+			task.cancel(StasisWaitThread)
+			StasisWaitThread = nil
+
+
+		end
+
+
 		-- Reset all requirements
 		Requirements.DataSaveLoop = false
 		Requirements.LockRenewLoop = false
 
 
 		-- Wait while another instance of Revive, Stasis or Cleanup is ongoing
-		-- NOTE: Do not add a check after wait in this case as post cleanup the vault should be unusable and not revertible
 		while OngoingActions.PrivateState.Current do OngoingActions.PrivateState.ChangeSignal:Wait() end
-		print("Cleaning up")
 
 
 		-- Save one final time
@@ -439,8 +569,15 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 		-- Send forget to the server who received current session's acquire
-		local message: Types.InterVaultMessage = {ServerSession=ServerSession, VaultSession=VaultSession, SentAt=DateTime.now().UnixTimestampMillis, Reason=Constants.InterVaultMessageReason.FORGET}
-		pcall(MessagingService.PublishAsync, MessagingService, AcquiresData.Sent.ServerSession..AcquiresData.Sent.VaultSession, message)
+		if AcquiresData.Sent.VaultSession ~= "" then
+
+
+			local message: Types.InterVaultMessage = {ServerSession=ServerSession, VaultSession=VaultSession, SentAt=DateTime.now().UnixTimestampMillis, Reason=Constants.InterVaultMessageReason.FORGET}
+			local success, result = pcall(MessagingService.PublishAsync, MessagingService, AcquiresData.Sent.ServerSession..":"..AcquiresData.Sent.VaultSession, message)
+			if not success then warn("[Retrying 3]", "MessagingService.PublishAsync Forget", result) end
+
+
+		end
 
 
 		-- Cleanup if lock acquire was still waiting
@@ -456,11 +593,13 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 	-- Performs operations based on messages received from another session or server
 	local function MessagingLogic(Message: {Data:Types.InterVaultMessage, Sent:number})
-		print("Message received", Message.Data.ServerSession, Message.Data.VaultSession, Message.Data.Reason, Message.Data.Extra)
-
 
 
 		if Message.Data.Reason == Constants.InterVaultMessageReason.ACQUIRE then
+
+
+			-- If this message is older than currently saved, ignore
+			if Message.Data.SentAt < AcquiresData.Received.At then return end
 
 
 			-- Save the server session id to upgrade lock in the future
@@ -469,8 +608,12 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 			AcquiresData.Received.At = Message.Data.SentAt
 
 
+			local message: Types.InterVaultMessage = {Reason=Constants.InterVaultMessageReason.ACQUIRE_OK, ServerSession=ServerSession, VaultSession=VaultSession, SentAt=DateTime.now().UnixTimestampMillis}
+			local success, result = pcall(MessagingService.PublishAsync, MessagingService, Message.Data.ServerSession..":"..Message.Data.VaultSession, message)
+			if not success then warn("[Retrying 3]", "MessagingService.PublishAsync Acquire response", result) end
+
 			-- If vault was already in stasis mode, upgrade directly
-			if VaultPrivateState == "STASIS" then CleanupAsync() end
+			if VaultPrivateState == Constants.VaultPrivateState.STASIS then CleanupAsync() end
 
 
 		elseif Message.Data.Reason == Constants.InterVaultMessageReason.FORGET then
@@ -478,11 +621,16 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 			-- Remove the last known acquirer if the same server sent Forget
 			if Message.Data.ServerSession == AcquiresData.Received.ServerSession and
-				Message.Data.VaultSession == AcquiresData.Received.VaultSession
+				Message.Data.VaultSession == AcquiresData.Received.VaultSession and
+				Message.Data.SentAt > AcquiresData.Received.At
 			then
+
+
 				AcquiresData.Received.ServerSession = ""
 				AcquiresData.Received.VaultSession = ""
 				AcquiresData.Received.At = 0
+
+
 			end
 
 
@@ -490,10 +638,15 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 			-- Acknowledgement received for acquire
-			if Message.Data.ServerSession == AcquiresData.Received.ServerSession and
-				Message.Data.VaultSession == AcquiresData.Received.VaultSession
+			if Message.Data.ServerSession == AcquiresData.Sent.ServerSession and
+				Message.Data.VaultSession == AcquiresData.Sent.VaultSession and
+				Message.Data.SentAt > AcquiresData.Sent.At
 			then
+
+
 				MessagingResponsesTimestamp.AcquireAck = Message.Data.SentAt
+
+
 			end
 
 
@@ -501,9 +654,12 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 			-- Other server released or upgraded the lock
-			if Message.Data.ServerSession == AcquiresData.Received.ServerSession and
-				Message.Data.VaultSession == AcquiresData.Received.VaultSession
+			if Message.Data.ServerSession == AcquiresData.Sent.ServerSession and
+				Message.Data.VaultSession == AcquiresData.Sent.VaultSession and
+				Message.Data.SentAt > AcquiresData.Sent.At
 			then
+
+
 				MessagingResponsesTimestamp.Released = Message.Data.SentAt
 
 
@@ -511,7 +667,9 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 				local thread = LockAcquireThread
 				LockAcquireThread = nil
 				LockData.LockedAt = Message.Data.SentAt
-				if thread ~= nil and coroutine.status(thread) == "suspended" then task.spawn(thread, true) end
+				if thread ~= nil and coroutine.status(thread) == "suspended" then task.spawn(thread) end
+
+
 			end
 		end
 	end
@@ -519,22 +677,18 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 	-- Starts preparation of Messaging service for the vault (skips if it is already prepared)
 	local function PrepareMessagingAsync()
-		print("PrepareMessagingAsync")
 
 
-		-- While another thread is modifying the state of the messaging, wait
+		-- While another thread is modifying the state of messaging, wait
 		while OngoingActions.MessagingChannel.Current do OngoingActions.MessagingChannel.ChangeSignal:Wait() end
 
 
 		-- If vault changed state while waiting, ignore the call
-		if VaultPrivateState ~= "REVIVE" then return end
+		if VaultPrivateState ~= Constants.VaultPrivateState.REVIVE then return end
 
 
 		-- Prevent other thread from modifying messaging
 		OngoingActions.MessagingChannel:Update(true)
-
-
-		print("Messaging preparing now")
 
 
 		-- Update the vault state
@@ -546,23 +700,26 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 		-- While messaging is unusable and required, try making it usable
-		while VaultPrivateState == "REVIVE" and not ReadyStates.Messaging do
+		while VaultPrivateState == Constants.VaultPrivateState.REVIVE and not ReadyStates.Messaging do
 
 
 			-- Try subscribing to the session
-			local success, result = pcall(MessagingService.SubscribeAsync, MessagingService, ServerSession..VaultSession, MessagingLogic)
+			local success, result = pcall(MessagingService.SubscribeAsync, MessagingService, ServerSession..":"..VaultSession, MessagingLogic)
 
 
 			-- If subscribe failed, retry after a delay
 			if not success then
+
+
 				warn("[Retrying 2] Attempt:", attempt, "MessagingService.SubscribeAsync", result)
-				attempt += 1
 				task.wait(2)
+				attempt += 1
 				continue
+
+
 			end
 
 
-			print("Messaging prepared")
 			MessagingChannel = result
 			ReadyStates.Messaging = true
 			break
@@ -576,7 +733,6 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 	-- Acquire lock
 	local function AcquireLockAsync()
-		print("AcquireLockAsync")
 
 
 		-- While another thread is modifying the state of the lock, wait
@@ -585,9 +741,6 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 		-- Prevent other thread from modifying lock
 		OngoingActions.LockChange:Update(true)
-
-
-		print("Acquiring lock")
 
 
 		-- Update the vault state
@@ -599,10 +752,10 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 		-- If lock is unacquired, and it is required, try to acquire it
-		while VaultPrivateState == "REVIVE" and not ReadyStates.Lock do
+		while VaultPrivateState == Constants.VaultPrivateState.REVIVE and not ReadyStates.Lock do
 
 
-			-- Remembers if a retry is required
+			-- Remembers if acquire needs to be sent
 			local acquireRequired = false
 			local currentLock: Types.LockData
 
@@ -620,7 +773,6 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 						-- Lock non-existent, instantly acquire it
-						print("Non existent lock", current)
 						LockData.LockedAt = now
 						return LockData
 
@@ -628,36 +780,33 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 					elseif current.ServerSession == ServerSession and current.VaultSession == VaultSession then
 
 
-						-- Current session owns it
-						print("Lock already owned")
-
-
 						-- Lock is stale, renew it
-						if current.LockedAt + Constants.MSLockStaleDelay < now then
-							print("Renewing stale lock")
+						if current.LockedAt + Constants.LockStaleDelayMS < now then
+
+
 							LockData.LockedAt = now
 							return LockData
+
+
 						end
 
 
 						-- Ignore update if lock is fresh
 						LockData = current
 						return nil
+
+
 					else
 
 
-						-- Owned by another server
-						print("Other server owns lock", current.ServerSession, current.VaultSession)
-						print("Me", ServerSession, VaultSession)
-
-
 						-- Lock is stale, and did not receive any response for 5 acquires, assume server dead
-						if (now - current.LockedAt) > Constants.MSLockStaleDelay and (AcquiresData.Sent.At - MessagingResponsesTimestamp.AcquireAck) >= Constants.MessagingExpectedDelay * 5 then
+						if (now - current.LockedAt) > Constants.LockStaleDelayMS and (AcquiresData.Sent.At - MessagingResponsesTimestamp.AcquireAck) >= Constants.MessagingExpectedDelayMS * 5 then
 
 
-							print("Server didnt respond for last 35 seconds and lock is older than 101 seconds... Stealing lock")
 							LockData.LockedAt = now
 							return LockData
+
+
 						end
 
 
@@ -665,21 +814,27 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 						acquireRequired = true
 						currentLock = current
 						return nil
+
+
 					end
-				end, Constants.MemoryStoreLockExpiryDelay)
+				end, Constants.LockExpiryDelayMS / 1000)
 
 
 			-- Update Failed, retry
 			if not success then
+
+
 				warn("[Retrying 3] Attempt:", attempt, "MemoryStore.UpdateAsync", result)
-				attempt += 1
 				task.wait(3)
+				attempt += 1
 				continue
+
+
 			end
 
 
-			-- Flag MemoryStore service as working
-			MemoryStoreWorking:Update(success)
+			-- Flag MemoryStore service as working or not
+			LastMemoryStoreActionSuccess:Update(success)
 
 
 			-- Needs to send acquire
@@ -694,25 +849,33 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 				-- or Response is older than recent acquire
 				-- or Response is older than Expected delay
 				-- For sending acquire again
-				if AcquiresData.Sent.VaultSession == "" or AcquiresData.Sent.At > MessagingResponsesTimestamp.AcquireAck or now - MessagingResponsesTimestamp.AcquireAck > Constants.MessagingExpectedDelay then
+				if AcquiresData.Sent.VaultSession == "" or AcquiresData.Sent.At > MessagingResponsesTimestamp.AcquireAck or now - MessagingResponsesTimestamp.AcquireAck > Constants.MessagingExpectedDelayMS then
 
 
-					-- If acquire was never sent, set last response as 1 second ago to prevent counting issues with 0 timestamp
+					-- If acquire was never sent, set last response as 1 ms ago to prevent counting issues with 0 timestamp
 					if AcquiresData.Sent.VaultSession == "" then
+
+
 						MessagingResponsesTimestamp.AcquireAck = now - 1
 						MessagingResponsesTimestamp.Released = now - 1
+
+
 					end
 
 
 					-- Send the acquire message
-					print("Sending acquire:", currentLock.ServerSession, currentLock.VaultSession)
-					now = DateTime.now().UnixTimestampMillis
 					local message: Types.InterVaultMessage = {ServerSession=ServerSession, VaultSession=VaultSession, SentAt=now, Reason=Constants.InterVaultMessageReason.ACQUIRE}
-					success, result = pcall(MessagingService.PublishAsync, MessagingService, currentLock.ServerSession..currentLock.VaultSession, message)
+					success, result = pcall(MessagingService.PublishAsync, MessagingService, currentLock.ServerSession..":"..currentLock.VaultSession, message)
 
 
-					-- Acquire send failed
-					if not success then warn("[Retrying]", "MessagingService.PublishAsync", result)
+					if not success then
+
+
+						-- Acquire send failed
+						warn("[Retrying 3]", "MessagingService.PublishAsync Acquire", result)
+						task.wait(3)
+
+
 					else
 
 
@@ -727,24 +890,22 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 						-- On another thread resume the thread with a fail status (if not resumed by response)
-						Thread.Delay((Constants.MessagingExpectedDelay) / 1000 + 1, function(...)
+						Thread.Delay((Constants.MessagingExpectedDelayMS) / 1000 + 1, function(...)
 
 
-							print("Manually resuming acquire thread")
 							local thread = LockAcquireThread
 							LockAcquireThread = nil
-							if thread ~= nil and coroutine.status(thread) == "suspended" then task.spawn(thread, false) end
+							if thread ~= nil and coroutine.status(thread) == "suspended" then task.spawn(thread) end
+
+
 						end)
 
 
-						-- Pause execution and on resume check if resumed by response or manually
-						print("Freezing acquire thread")
-						if not coroutine.yield() then continue end
+						-- Pause execution and on resume with check if resumed by response or timeout
+						coroutine.yield()
+						continue
 
 
-						-- Break out of loop if resumed by response
-						ReadyStates.Lock = true
-						break
 					end
 				end
 
@@ -756,6 +917,8 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 				LastActionCompletions.LockSave = LockData.LockedAt
 				ReadyStates.Lock = true
 				break
+
+
 			end
 		end
 
@@ -767,22 +930,10 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 	-- Read initial data from datastore
 	local function ReadDataAsync()
-		print("ReadDataAsync")
-
-
-		-- While another thread is modifying the state of the data, wait
-		while OngoingActions.DataChange.Current do OngoingActions.DataChange.ChangeSignal:Wait() end
 
 
 		-- If vault state changed while waiting, ignore the call
-		if VaultPrivateState ~= "REVIVE" then return end
-
-
-		-- Prevent other threads from modifying data
-		OngoingActions.DataChange:Update(true)
-
-
-		print("Reading data now")
+		if VaultPrivateState ~= Constants.VaultPrivateState.REVIVE then return end
 
 
 		-- Update the vault state
@@ -794,7 +945,7 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 		-- Keep trying till vault is in revive state and initial data is not read
-		while VaultPrivateState == "REVIVE" and not ReadyStates.InitialData do
+		while VaultPrivateState == Constants.VaultPrivateState.REVIVE and not ReadyStates.InitialData do
 
 
 			-- Try reading data from DataStore
@@ -802,29 +953,33 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 			-- Mark Datastore Service working or not
-			DataStoreWorking:Update(success)
+			LastDataStoreActionSuccess:Update(success)
 
 
 			-- If read failed, retry after some time
 			if not success then
-				warn("[Retrying 5] Attempt:", attempt, "DataStore.GetAsync", result)
+
+
+				warn("[Retrying 6] Attempt:", attempt, "DataStore.GetAsync", result)
 				attempt += 1
 				task.wait(6)
 				continue
+
+
 			end
+
+
+			-- Mark function start time
+			local now = DateTime.now().UnixTimestampMillis
 
 
 			-- If data existed, use it
 			if result ~= nil then
 
 
-				print("Found old data")
-				local now = DateTime.now().UnixTimestampMillis
-				DSData = result
-
-
 				-- Reconcile missing values
-				Utils.Reconcile(DSData.__PUBLIC, template)
+				ActivityData = Utils.Reconcile(result.__ACTIVITY, ActivityData)
+				PublicData = Utils.Reconcile(result.__PUBLIC, template)
 
 
 				-- Flag last data change timestamps
@@ -836,42 +991,40 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 				-- If no data exist in datastore, use the default data and flag for a save
-				print("Using default data")
-				DSData.__PUBLIC = Utils.DeepClone(template)
+				PublicData = Utils.DeepClone(template)
+
+
 			end
 
 
 			-- Update activity based on visible or hidden use
 			if not vault.Hidden then
-				if DSData.__ACTIVITY.FirstLogIn == 0 then DSData.__ACTIVITY.FirstLogIn = VaultOpentime end
-				DSData.__ACTIVITY.LastLogIn = VaultOpentime
+
+
+				if ActivityData.FirstLogIn == 0 then ActivityData.FirstLogIn = now end
+				ActivityData.LastLogIn = now
+				vault:UpgradeToVisible()
+
+
 			end
 
 
 			-- Set initial data as read
-			ReadyStates.DataChanges = true
 			ReadyStates.InitialData = true
 			break
+
+
 		end
-
-
-		-- Release data change lock for other threads
-		OngoingActions.DataChange:Update(false)
 	end
 
 
 	-- Upon data read, Save it every fixed amount of time
-	-- TODO: Needs minor optimization for AFK vaults (loop runs (full DSSaveLoopDelay duration) even for AFK vault)
 	local function DataSaveLoop()
-		print("DSSaveLoop")
 
 
 		-- If there exist another loop, don't start a new loop
-		if OngoingActions.DataSaveLoop or not Requirements.DataSaveLoop then return end
+		if OngoingActions.DataSaveLoop then return end
 		OngoingActions.DataSaveLoop = true
-
-
-		print("Data save loop start")
 
 
 		-- While ds save loop is required, keep running with delay
@@ -883,42 +1036,51 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 			-- If initial data not read, wait entire period
-			if not ReadyStates.InitialData then print("Initial data not read"); task.wait(Constants.DSSaveLoopDelay / 1000); continue end
+			if not ReadyStates.InitialData then task.wait(Constants.DataSaveLoopDelayMS / 1000); continue end
 
 
 			-- If no unsaved changes, wait entire period
-			if not ReadyStates.DataChanges then print("No unsaved change"); task.wait(Constants.DSSaveLoopDelay / 1000); continue end
+			if not ReadyStates.DataChanges then task.wait(Constants.DataSaveLoopDelayMS / 1000); continue end
 
 
-			-- Recent change was within last 5 seconds and last save was within last DSSaveLoopDelay (60 seconds), wait a small period and attempt save
-			if now - LastActionCompletions.DataChange < 5000 and now - LastActionCompletions.DataSave < Constants.DSSaveLoopDelay then print("Last change too recent"); task.wait(10); continue end
+			-- Recent change was within last 5 seconds and last save was within last DataSaveLoopDelayMS (60 seconds), wait a small period and attempt save
+			if now - LastActionCompletions.DataChange < 5000 and now - LastActionCompletions.DataSave < Constants.DataSaveLoopDelayMS then task.wait(10); continue end
 
 
 			-- Regular save
 			SaveDataAsync(false)
+
+
 		end
 
 
 		-- Allow other threads to start new loop
-		print("Data save loop end")
 		OngoingActions.DataSaveLoop = false
+
+
 	end
 
 
 	-- Set the vault in a semi-released mode where the vault is in the hands of the current server but lock is not renewed nor is data saved
 	-- Only use for this mode is to prevent re-reviving a new vault and resume operation on this one
 	local function StasisAsync()
-		print("StasisAsync")
+
+
+		-- Prevent already stasis or cleaned vaults
+		if VaultPrivateState == Constants.VaultPrivateState.STASIS or VaultPrivateState == Constants.VaultPrivateState.CLEANUP then return end
 
 
 		-- Set private states
-		VaultPrivateState = "STASIS"
+		VaultPrivateState = Constants.VaultPrivateState.STASIS
 		local now = DateTime.now().UnixTimestampMillis
 		LastAchievedStates.Stasis = now
 
 
 		-- If vault was in visible state, set the last logout
-		if not vault.Hidden then DSData.__ACTIVITY.LastLogOut = now end
+		if not vault.Hidden then
+			ActivityData.LastLogOut = now
+			ReadyStates.DataChanges = true
+		end
 
 
 		-- Reset requirement flags
@@ -931,10 +1093,7 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 		-- If changed state while waiting, quit
-		if VaultPrivateState ~= "STASIS" then
-			OngoingActions.PrivateState:Update(false)
-			return
-		end
+		if VaultPrivateState ~= Constants.VaultPrivateState.STASIS then return end
 
 
 		-- Prevent another instance of Revive, Stasis or Cleanup
@@ -944,6 +1103,8 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 		-- If lock was not acquired even after waiting, directly cleanup without any wait
 		-- Or if another server is waiting for the vault to close, directly cleanup
 		if not ReadyStates.Lock or AcquiresData.Received.VaultSession ~= "" then
+
+
 			Thread.Spawn(CleanupAsync)
 			OngoingActions.PrivateState:Update(false)
 			return
@@ -953,17 +1114,21 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 			-- Save before going stasis
-			-- TODO: saving before going stasis removes the possibility of server crashing (data lost while stasis) but it causes unnecessary frequent saves for server jumpers
+			-- NOTE: saving before going stasis removes the possibility of server crashing (data lost while stasis) but it causes unnecessary frequent saves for server jumpers
 			if ReadyStates.InitialData and ReadyStates.DataChanges then SaveDataAsync(true) end
-			if VaultPrivateState ~= "STASIS" then
+			if VaultPrivateState ~= Constants.VaultPrivateState.STASIS then
+
+
 				OngoingActions.PrivateState:Update(false)
 				return
+
+
 			end
 
 
 			-- Add a new delayed thread that waits for a specific time and then cleans up the vault automatically if it has been sitting idle all that time
-			Thread.Delay((Constants.MemoryStoreLockExpiryDelay - Constants.MSLockRenewalDelay) / (2 * 1000), function()
-				if VaultPrivateState == "STASIS" and now == LastAchievedStates.Stasis then CleanupAsync() end
+			StasisWaitThread = task.delay((Constants.LockExpiryDelayMS - Constants.LockRenewalDelayMS) / (2 * 1000), function()
+				if VaultPrivateState == Constants.VaultPrivateState.STASIS and now == LastAchievedStates.Stasis then CleanupAsync() end
 			end)
 
 
@@ -973,13 +1138,14 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 			-- Release private state lock
 			OngoingActions.PrivateState:Update(false)
+
+
 		end
 	end
 
 
-	-- Renew lock only when it gets closer to stale
+	-- Renews lock only when it gets closer to stale
 	local function RenewLockAsync()
-		print("RenewLockAsync")
 
 
 		-- While another thread is modifying lock, wait
@@ -991,18 +1157,15 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 		-- If renew was called too early, return and do nothing
-		if Constants.MSLockRenewalDelay / 2 >= (now - LastActionCompletions.LockSave) then return end
+		if Constants.LockRenewalDelayMS / 2 >= (now - LastActionCompletions.LockSave) then return end
 
 
 		-- Prevent other threads from modifying lock
 		OngoingActions.LockChange:Update(true)
 
 
-		print("Renewing lock")
-
-
 		-- Execute as pcall to prevent errors breaking the loop
-		local success = pcall(vaultHolder.LockMemoryStore.UpdateAsync, vaultHolder.LockMemoryStore, vaultName,
+		local success, last:Types.LockData? = pcall(vaultHolder.LockMemoryStore.UpdateAsync, vaultHolder.LockMemoryStore, vaultName,
 			function(current: Types.LockData?): Types.LockData?
 
 
@@ -1024,30 +1187,36 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 					-- For lost lock, mark lock as released, discard any unsaved changes and cleanup the vault
 					ReadyStates.DataChanges = false
 					ReadyStates.Lock = false
-					Thread.Spawn(CleanupAsync)
+					VaultUsable:Update(false)
+					Thread.Defer(CleanupAsync)
 					return nil
+
+
 				end
-			end, Constants.MemoryStoreLockExpiryDelay)
+			end, Constants.LockExpiryDelayMS / 1000)
 
 
 		-- Mark MemoryStore service as working or not
-		MemoryStoreWorking:Update(success)
-
+		LastMemoryStoreActionSuccess:Update(success)
 
 
 		if not success then
+
+
 			-- Let other threads modify lock
 			OngoingActions.LockChange:Update(false)
 
 
 			-- If failed and last updated is longer than memory store limit, close the vault
-			if DateTime.now().UnixTimestampMillis - LastActionCompletions.LockSave > Constants.MemoryStoreLockExpiryDelay - Constants.MSLockRenewalDelay then CleanupAsync() end
+			if DateTime.now().UnixTimestampMillis - LastActionCompletions.LockSave > Constants.LockExpiryDelayMS - Constants.LockRenewalDelayMS then CleanupAsync() end
 			return
+
+
 		end
 
 
 		-- If lock saved successfully, update the last updated time
-		LastActionCompletions.LockSave = LockData.LockedAt
+		if last ~= nil then LastActionCompletions.LockSave = last.LockedAt end
 
 
 		-- Unlock lock modifications
@@ -1057,29 +1226,22 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 	-- Upon lock acquire, keep it updated every fixed amount of time
 	local function LockRenewLoop()
-		print("LockRenewLoop")
 
 
 		-- If there exist another loop, don't start a new loop
-		if OngoingActions.LockRenewLoop or not Requirements.LockRenewLoop then return end
+		if OngoingActions.LockRenewLoop then return end
 		OngoingActions.LockRenewLoop = true
-
-
-		print("Lock renew loop start")
 
 
 		-- While lock renew loop is required, keep renewing with delay
 		while Requirements.LockRenewLoop do
-			task.wait(math.max(0, (Constants.MSLockRenewalDelay - (DateTime.now().UnixTimestampMillis - LastActionCompletions.LockSave))/1000))
+			task.wait(math.max(0, (Constants.LockRenewalDelayMS - (DateTime.now().UnixTimestampMillis - LastActionCompletions.LockSave))/1000))
 			RenewLockAsync()
 		end
 
 
-		print("Lock renew loop end")
-
-
 		-- Allow other threads to start loop now
-		Requirements.LockRenewLoop = false
+		OngoingActions.LockRenewLoop = false
 	end
 
 
@@ -1088,8 +1250,12 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 	local function ReviveAsync()
 
 
+		-- Prevent already revived or cleaned vaults
+		if VaultPrivateState == Constants.VaultPrivateState.REVIVE or VaultPrivateState == Constants.VaultPrivateState.CLEANUP then return end
+
+
 		-- Set private states
-		VaultPrivateState = "REVIVE"
+		VaultPrivateState = Constants.VaultPrivateState.REVIVE
 
 
 		-- Set all requirement flags
@@ -1102,7 +1268,7 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 		-- If stasis or cleanup was called while waiting, quit
-		if VaultPrivateState ~= "REVIVE" then return end
+		if VaultPrivateState ~= Constants.VaultPrivateState.REVIVE then return end
 
 
 		-- Prevent another instance of Revive, Stasis or Cleanup
@@ -1110,24 +1276,32 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 		-- Blocking Setup Messaging until it is required and not set up
-		if VaultPrivateState == "REVIVE" and not ReadyStates.Messaging then PrepareMessagingAsync() end
+		if VaultPrivateState == Constants.VaultPrivateState.REVIVE and not ReadyStates.Messaging then PrepareMessagingAsync() end
 
 
 		-- If vault was called for stasis or cleanup by the time messaging was prepared, close and let it take over
-		if VaultPrivateState ~= "REVIVE" then
+		if VaultPrivateState ~= Constants.VaultPrivateState.REVIVE then
+
+
 			OngoingActions.PrivateState:Update(false)
 			return
+
+
 		end
 
 
 		-- Blocking Lock acquire until it is required and not acquired
-		if VaultPrivateState == "REVIVE" and not ReadyStates.Lock then AcquireLockAsync() end
+		if VaultPrivateState == Constants.VaultPrivateState.REVIVE and not ReadyStates.Lock then AcquireLockAsync() end
 
 
 		-- If lock is not acquired yet and vault was called for stasis or cleanup, close and let it take over
-		if VaultPrivateState ~= "REVIVE" and not ReadyStates.Lock then
+		if VaultPrivateState == Constants.VaultPrivateState.CLEANUP or (VaultPrivateState ~= Constants.VaultPrivateState.REVIVE and not ReadyStates.Lock) then
+
+
 			OngoingActions.PrivateState:Update(false)
 			return
+
+
 		end
 
 
@@ -1135,17 +1309,8 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 		Thread.Defer(LockRenewLoop)
 
 
-		-- If another server requested acquire, close and let cleanup take over
-		-- Don't release just yet because the caller of this might be a remote update which is compulsory, or have this part and let the remote update just auto reject
-		--if AcquireReceivedFrom ~= "" then
-		--	VaultPrivateStateChanging:Update(false)
-		--	CleanupAsync()
-		--	return
-		--end
-
-
 		-- If data is not present, read the data
-		if not ReadyStates.InitialData then ReadDataAsync() end
+		if VaultPrivateState ~= Constants.VaultPrivateState.CLEANUP and not ReadyStates.InitialData then ReadDataAsync() end
 
 
 		-- Set the vault state
@@ -1170,6 +1335,13 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 	-- This function call is compulsory in order to prevent a vault from getting released automatically (in scenarios like trading where keeping the vault open till trade succeeds)
 	-- Similarly, calling the release function is compulsory to let the profile release freely
 	function vault:AddReader()
+
+
+		-- Return dummy if server already shutting down
+		if ServerShuttingDown.Current then 
+			warn("Attempted to open vault after server shutdown")
+			return function() end 
+		end
 
 
 		-- Infinitely scale count to serve individual reader
@@ -1207,10 +1379,11 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 
 
 				-- If server is shutting down then directly cleanup else move to stasis mode
-				print("No active readers")
-				if ServerShuttingDown then CleanupAsync()
+				if ServerShuttingDown.Current then CleanupAsync()
 				else StasisAsync()
 				end
+
+
 			end
 		end
 
@@ -1227,6 +1400,17 @@ local function GetVault<DataT>(dsName: string, vaultName: string, hidden:boolean
 	end
 
 
+	--Save the vault in vault holder
+	vaultHolder.Vaults[vaultName] = vault
+	VaultsCount:Update(VaultsCount.Current + 1)
+
+
+	-- Cleanup forcefully if server shutdown is called
+	ShutdownConnection = ServerShuttingDown.ChangeSignal:Once(function(prev: boolean, now: boolean)
+		if now then CleanupAsync() end
+	end)
+
+
 	return vault
 end
 
@@ -1234,7 +1418,6 @@ end
 return table.freeze({
 	GetVault = GetVault,
 	ServerShuttingDown = ServerShuttingDown,
-	MemoryStoreWorking = MemoryStoreWorking,
-	DataStoreWorking = DataStoreWorking,
-	Types=Types,
+	MemoryStoreWorking = LastMemoryStoreActionSuccess,
+	DataStoreWorking = LastDataStoreActionSuccess,
 })

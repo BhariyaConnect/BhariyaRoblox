@@ -20,10 +20,17 @@ return {
 		RELEASED 			= 7 	:: Types.VaultState, -- Vault was released and cleaned up rendering unusable
 	}),
 
-	MSLockRenewalDelay 					= 20 * 1000, -- 20 seconds (Server updates MS after this interval)
-	MSLockStaleDelay 					= (20 * 1000 * 5) + 1000, -- 101 seconds (5 misses) (MS not updated for this interval is considered down or dead)
-	MemoryStoreLockExpiryDelay 			= 30 * 60 * 1000, -- 30 minutes (MS exist for this interval so other servers can see who owned the lock before down or dead, or still owns it)
+	VaultPrivateState = table.freeze({
+		UNKNOWN			= 0		:: Types.VaultPrivateState,
+		REVIVE			= 1		:: Types.VaultPrivateState,
+		STASIS			= 2		:: Types.VaultPrivateState,
+		CLEANUP			= 3		:: Types.VaultPrivateState,
+	}),
 
-	MessagingExpectedDelay				= 7 * 1000, -- 7 seconds
-	DSSaveLoopDelay 					= 60 * 1000, -- 60 seconds
+	LockRenewalDelayMS 					= 20 * 1000, -- 20 seconds (Server updates MS after this interval)
+	LockStaleDelayMS 					= (20 * 1000 * 5) + 1000, -- 101 seconds (5 misses) (MS not updated for this interval is considered down or dead)
+	LockExpiryDelayMS 					= 30 * 60 * 1000, -- 30 minutes (MS exist for this interval so other servers can see who owned the lock before down or dead, or still owns it)
+
+	MessagingExpectedDelayMS			= 7 * 1000, -- 7 seconds
+	DataSaveLoopDelayMS 				= 60 * 1000, -- 60 seconds
 }
