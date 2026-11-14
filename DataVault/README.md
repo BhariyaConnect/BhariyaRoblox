@@ -1,1 +1,1 @@
-# DataVault v0.3.0
+# DataVault v1.0.0
