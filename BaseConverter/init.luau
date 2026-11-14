@@ -3,7 +3,7 @@
 --!optimize 2
 
 --[[
-BaseConverter v1.0.0
+BaseConverter v1.1.0
 
 
 WHY:
@@ -33,6 +33,7 @@ local CHARACTER_SET = {
 
 	"A","B","C","D","E","F","G","H","I","J",
 	"K","L","M","N","O","P","Q","R","S","T",
+
 	"U","V","W","X","Y","Z",
 
 	"0","1","2","3","4","5","6","7","8","9",
@@ -40,11 +41,15 @@ local CHARACTER_SET = {
 	"!","@","#","$","%","^","&","*","(",")",
 	"-","_","=","+","[","]","{","}",";",":",
 	",",".","<",">","?","~"
-} -- #88 as of 06-09-2026
+}
 
 
 -- Base of the encoded string value
 local BASE = #CHARACTER_SET
+
+
+-- Negative sign
+local NEGATIVE_SIGN = "|"
 
 
 -- Reverse map
@@ -59,7 +64,15 @@ end
 
 
 -- Encode a number to its string form
-function Encode(n: number)
+local function Encode(n: number): string
+
+
+	-- Determine whether the number is negative
+	local isNegative = n < 0
+
+
+	-- Convert to positive number
+	n = math.abs(n)
 
 
 	-- No modulus loop is required if the number is zero
@@ -88,13 +101,31 @@ function Encode(n: number)
 
 
 	-- Concat of the table gives the final encoded string
-	return table.concat(result)
+	local encoded = table.concat(result)
+
+
+	-- Add the negative sign if necessary
+	if isNegative then
+		return NEGATIVE_SIGN .. encoded
+	end
+
+
+	return encoded
 end
 
 
 -- Decode an encoded string back to its numeric form
--- Will error if invalid string is passed (Base different from current base)
-function Decode(s: string)
+local function Decode(s: string): number
+
+
+	-- Check for negative sign
+	local isNegative = s:sub(1, 1) == NEGATIVE_SIGN
+
+
+	-- Remove the sign if negative
+	if isNegative then
+		s = s:sub(2)
+	end
 
 
 	-- Final numeric value, start with 0
@@ -106,11 +137,11 @@ function Decode(s: string)
 	local digit: number
 
 
-	-- For each letter, find the number from the reverse map
-	for i = 1, #s:reverse() do
+	-- For each character, find the number from the reverse map
+	for i = #s, 1, -1 do
 
 
-	-- Convert the character
+		-- Convert the character
 		char = s:sub(i, i)
 		digit = CHAR_TO_VALUE[char]
 
@@ -125,6 +156,11 @@ function Decode(s: string)
 
 
 	-- Return the final sum of all letters converted to number
+	if isNegative then
+		return -value
+	end
+
+
 	return value
 end
 
