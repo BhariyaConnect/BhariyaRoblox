@@ -4,7 +4,7 @@
 
 
 --[[
-Promise v1.0.0
+Promise v2.0.0
 
 
 WHY:
@@ -15,13 +15,11 @@ WHY:
 
 NOTES:
 - Promise has generic types so when using function autofill, it can help with variable names and types.
+	Deferred general types does not auto infer but IntelliSense helps if types are manually mentioned.
 - Promise will keep its status and value even after competition (immutable after first change)
-- AndThen and Catch(a wrapper over AndThen) will return a chained Promise
-- AndThen and Catch will not provide resolve or reject callbacks,
-	instead the return or errors thrown in the AndThen or Catch executor will be used as resolve or reject parameters for the chained promise,
-	with the exception when no return or error is caused, in that case the parent's resolve or reject values are passed down.
+	Resetting a promise or deferred keeps its previous waiters still waiting (if any) and lets the promise resolve or reject again
 - Deferred is a wrapper over Promise that provides the resolver and rejecter for external competition
-- Deferred does not take or execute any function, user is supposed to run the function on their own
+- Deferred does not take or execute any function, user is supposed to run any task they want to, on their own
 
 
 TESTS:
@@ -32,236 +30,318 @@ TESTS:
 UPDATES:
 - 07-09-2026
 	Minor changes and rearrangements for use in external editors
+- 21-11-2026
+	Ditched setmetatable and now used simple tables, this way doesn't expose internal variables
+	Changed promise to resolve or reject to a single value instead of a tuple
+	Await, AndThen and Catch are not field based functions instead of earlier method calls,
+		i.e. they are now invoked using (.) instead of (:)
+	Promise now has reset option
 ]]
 
 
--- Depends on my Thread Module
--- Replace usage with task.spawn and task.defer if thread module is not desired
 local Thread = require(script.Parent:WaitForChild("Thread"))
 
 
--- Promise allows a function to execute and return a result in the future using yielding or callback based methods 
-local Promise = {} :: Promise
-Promise.__index = Promise
-
-
 -- Promise type
-export type Promise<ResolveT... = ...any, RejectT... = ...any> = {
-	AndThen: (self: Promise<ResolveT..., RejectT...>, onResolve: ((ResolveT...) -> ())?, onReject: ((RejectT...) -> ())?) -> Promise<ResolveT..., RejectT...>,
-	Catch: (self: Promise<ResolveT..., RejectT...>, onReject: (RejectT...) -> ()) -> Promise<ResolveT..., RejectT...>,
-	Await: (self: Promise<ResolveT..., RejectT...>) -> (boolean, any),
-	_result: {any},
-	_waiters: {(boolean, ...any)->()},
-	_completed: boolean,
-	_success: boolean,
-	__index: Promise<ResolveT..., RejectT...>
+export type Promise<ResT=any, RejT=any> = {
+	AndThen: (onResolve: ((ResT) -> ())?, onReject: ((RejT) -> ())?) -> (),
+	Catch: (onReject: (RejT) -> ()) -> (),
+	Await: () -> (boolean, ResT & RejT),
+	Reset: () -> (),
 }
-
-
--- AndThen requires 2 callbacks, one for when the promise resolves and one optional for when it rejects
--- Returns a new chained promise
--- The chained promise can not have its own resolve and reject, instead the value(s) or error returned will act as the resolve and reject values
--- If no callbacks are provided for the chained promise, the parent's results will be reused as the chained promise's results
--- A chained promise might resolve even if its parent rejects, if callbacks return no errors
-function Promise:AndThen(onResolve, onReject)
-
-
-	-- Create and return the new chained promise
-	return NewPromise(function(resolve, reject)
-
-
-		-- Function to process current promise if parent gets rejected
-		local function handleParentCompletion(successful: boolean, ...)
-
-
-			-- Switch based on success
-			local passedCallback = if successful then onResolve else onReject
-			local chainCallback = if successful then resolve else reject
-
-
-			-- If a onReject callback was not provided, reject with parent's reason thrown values
-			if not passedCallback then
-				return chainCallback(...)
-			end
-
-
-			-- Call onReject safely
-			local result = {pcall(passedCallback, ...)}
-
-
-			-- Parse the return values
-			local success = table.remove(result, 1)
-			result = table.unpack(result)
-
-
-			-- Resolve or reject the chained promise based on onReject's return or thrown errors
-			if success then
-				resolve(result) else
-				reject(result)
-			end
-		end
-
-
-		-- If parent promise already completed, simply execute the new promise's resolve/reject, else add them to current promise's callback list
-		if self._completed then
-			Thread.Spawn(handleParentCompletion, self._success, table.unpack(self._result))
-			return
-		end
-
-
-		table.insert(self._waiters, handleParentCompletion)
-	end)
-end
-
-
--- Catch is a wrapper over AndThen
--- Attaches a callback as the reject parameter of a promise
--- Gets executed ONLY AND ONLY if the promise gets rejected
--- Returns a new Promise as a chain just like AndThen
-function Promise:Catch(onReject)
-	return self:AndThen(nil, onReject)
-end
-
-
--- Returns a boolean with a value if resolved or a reason if the promise was rejected
--- Yields the caller until the promise completes
-function Promise:Await()
-
-
-	-- If promise was already complete, simply return the already completed values with the success flag
-	if self._completed then
-		return self._success, table.unpack(self._result)
-	end
-
-
-	-- Fetch the current thread
-	local currentThread = coroutine.running()
-
-
-	-- Add the thread to the waiter list with a resume callback
-	table.insert(self._waiters, function(success: boolean, ...) task.spawn(currentThread, success, ...) end)
-
-
-	-- Yield the caller thread until promise completes
-	return coroutine.yield()
-end
-
-
--- Deferred is a wrapper over Promise that allows external competition signaling for the internal promise
-local Deferred = {} :: Deferred
-Deferred.__index = Deferred
-
 
 -- Deferred type
-export type Deferred<ResolveT... = (), RejectT... = ()> = {
-	Promise: Promise<ResolveT..., RejectT...>,
-	Resolve: (self: Deferred<ResolveT..., RejectT...>, ResolveT...) -> (),
-	Reject: (self: Deferred<ResolveT..., RejectT...>, RejectT...) -> (),
-	Reset: (self: Deferred<ResolveT..., RejectT...>) -> (),
-	_resolver: (ResolveT...) -> (),
-	_rejecter: (RejectT...) -> (),
-	__index: Deferred<ResolveT..., RejectT...>
+export type Deferred<ResT, RejT> = {
+	Promise: Promise<ResT, RejT>,
+	Resolve: (ResT) -> (),
+	Reject: (RejT) -> (),
+	Reset: () -> (),
 }
 
 
--- Resolve a deferred promise
-function Deferred:Resolve(...)
-	self._resolver(...)
-end
+-- Creates a new promise with an executor as parameter
+-- The executor can resolve the promise using the resolve callback or reject the promise with either reject callback, or throwing an error in which case the error will be used as the result
+-- NOTE: Executor function must not complete before its resolver or rejecter is called, in that case promise will be instantly resolved with the result "Promise executor completed without calling resolve or reject"
+-- To avoid this case (if the resolve or reject call is in a new thread) wait for the thread to end at the end of the executor function
+local function CreatePromise<ResT, RejT>(executor: (resolve: (ResT) -> (), reject: (RejT) -> ()) -> ()): Promise<ResT, RejT>
 
 
--- Reject a deferred promise
-function Deferred:Reject(...)
-	self._rejecter(...)
-end
+-- Completion states containing result and waiters and completed flag
+	local succeeded: boolean? = nil
+	local waiters: {(boolean, ResT|RejT)->()} = {}
+	local completionResult: ResT|RejT
 
 
--- Reset a deferred promise so it can be reused
-function Deferred:Reset()
-	self.Promise._completed = false
-	self.Promise._success = false
-end
+	-- Function responsible for completing the promise
+	local function markComplete(s: boolean, r: ResT|RejT)
 
 
--- Creates a new promise with a onResolve and onReject
--- The executor can resolve the promise using the resolve callback or reject the promise with either reject callback, or throwing an error in which case the error will be used as the result 
-function NewPromise<ResolveT..., RejectT...>(executor: (resolve: (ResolveT...) -> (), reject: (RejectT...) -> ()) -> ())
+		--If the promise has already resolved or rejected, ignore further attempts to resolve or reject it
+		if succeeded ~= nil then return end
 
 
-	-- Create a fresh promise
-	local promise = setmetatable({_waiters = {}}, Promise) :: Promise<ResolveT..., RejectT...>
+		-- Set the new state
+		succeeded = s
+		completionResult = r
 
 
-	local function markCompleted(success: boolean, ...)
-
-
-		-- Skip if promise was already resolved or rejected
-		if promise._completed then
-			return
-		end
-
-
-		-- Set the resolved status and values
-		promise._completed = true
-		promise._success = success
-		promise._result = table.pack(...)
-
-
-		-- Execute all callbacks in different threads
-		for _, callback in promise._waiters do
-			Thread.Spawn(callback, success, ...)
-		end
-
-
-		-- Dereference all callbacks
-		table.clear(promise._waiters)
+		-- Spawn all waiting threads and clear the table
+		for _, callback in waiters do Thread.Spawn(callback, s, r) end
+		table.clear(waiters)
 	end
 
 
-	-- Run the executor in a new thread
+	-- Start the executor function in a new thread (automatically safe, but it absorbs all errors)
 	Thread.Spawn(function()
 
 
-		-- Pcall is used for safe execution, so executor errors are caught and passed as rejected promise
+		-- Start the executor function in a pcall to retrieve errors
 		local success, reason = pcall(executor,
-			function(...) markCompleted(true, ...) end,
-			function(...) markCompleted(false, ...) end
+			function(r: ResT|RejT) markComplete(true, r) end,
+			function(r: ResT|RejT) markComplete(false, r) end
 		)
 
 
-		-- If caller errors, simply reject the promise
-		if not success then
-			markCompleted(false, reason)
+		-- In case promise did not have a resolving or rejecting call, automatically
+		markComplete(success, reason or "Promise executor completed without calling resolve or reject")
+	end)
+
+
+	-- AndThen attaches 2 optional callbacks that are called when the promise resolves or rejects respectively
+	-- Unlike JavaScript promises, AndThen does not return a chained promise
+	local function AndThen(onResolve: ((ResT)->())?, onReject: ((RejT)->())?)
+
+
+		-- Function that checks for passed functions and executes based on success
+		local function onComplete(successful: boolean, res: ResT|RejT)
+			if successful == true then
+				if onResolve ~= nil then onResolve(res :: ResT) end
+			else
+				if onReject ~= nil then onReject(res :: RejT) end
+			end
+		end
+
+
+		-- If promise has already complete, execute directly else add to waiters
+		if succeeded == nil then table.insert(waiters, onComplete)
+		else onComplete(succeeded, completionResult)
+		end
+	end
+
+
+	-- Catch, similar to AndThen takes only one function (onReject) as argument
+	-- Unlike JavaScript promises, Catch does not return a chained promise
+	local function Catch(onReject: (RejT)->())
+		AndThen(nil, onReject)
+	end
+
+
+	-- Await returns the success and result if promise is already complete
+	-- else halts current thread till the promise completes and then returns the success and result
+	local function Await(): (boolean, ResT|RejT)
+
+
+		-- Return if promise already completed
+		if succeeded ~= nil then return succeeded, completionResult end
+
+
+		-- Collect current thread (coroutine)
+		local currentThread = coroutine.running()
+
+
+		-- Insert a callback that resumes current thread with the success and result
+		table.insert(waiters,
+			function(s: boolean, r:ResT|RejT)
+				task.spawn(currentThread, s, r)
+			end)
+
+
+		-- Yield the current thread
+		return coroutine.yield()
+	end
+
+
+	local function Reset()
+		succeeded = nil
+	end
+
+
+	-- Return the methods
+	return {AndThen = AndThen, Catch = Catch, Await = Await, Reset = Reset}
+end
+
+
+-- Dummy promise object that allows resolving and rejecting externally
+local function CreateDeferred<ResT, RejT>(): Deferred<ResT, RejT>
+
+
+	-- Store the resolver and rejecter
+	local resolver: (ResT)->()
+	local rejecter: (RejT)->()
+
+
+	-- Dummy promise
+	local promise = CreatePromise(function(resolve: (ResT)->(), reject: (RejT)->())
+		resolver = resolve
+		rejecter = reject
+	end)
+
+
+	-- Return the methods
+	return {Promise = promise, Resolve = resolver, Reject = rejecter, Reset = promise.Reset}
+end
+
+
+-- Takes a function and its parameter and returns a promise that resolves with the function's return or rejects with any error caused
+local function Promisify<ParaT, ResT>(func: (ParaT)->ResT, parameter: ParaT)
+
+
+	-- Defer is used instead of a promise because of luau's type inference issues
+	local deferred = CreateDeferred() :: Deferred<ResT, any>
+
+
+	-- Execute function in a new thread and resolve or reject accordingly
+	Thread.Spawn(function()
+		local success, result = pcall(func, parameter)
+		if success then deferred.Resolve(result)
+		else deferred.Reject(result)
 		end
 	end)
 
 
-	return promise
+	-- Return the deferred promise
+	return deferred.Promise
 end
 
 
--- Creates a promise with the onReject and onResolve returned for external completion
--- Deferred has no way of executing a function, so any function that needs to execute should be run by the caller separately, and the defer's resolve and reject should be called by the caller
-function NewDeferred<ResolveT..., RejectT...>()
+-- Takes an iterable of promises as input and returns a single Promise. This returned promise fulfills when all of the input's promises fulfill
+local function All(iterable: {Promise})
+	return CreatePromise(function(resolve: (any)->(), reject)
 
 
-	-- Create a deferred object that will store all the methods and the promise itself
-	local deferred = setmetatable({}, Deferred) :: Deferred<ResolveT..., RejectT...>
+		-- Pre count the number of promises passed
+		local count = #iterable
 
 
-	-- Create a fake promise that saves the signaling functions
-	deferred.Promise = NewPromise(function(resolve, reject)
-		deferred._resolver = resolve
-		deferred._rejecter = reject
+		-- If empty iterable, resolve with empty list immediately
+		if count == 0 then
+			resolve({})
+			return
+		end
+
+
+		-- Create result table and count completed
+		local results = table.create(count)
+		local completed = 0
+
+
+		-- For each promise passed, save the result in correct order of receiving
+		for index, promise in iterable do
+			promise.AndThen(function(value)
+				results[index] = value
+				completed += 1
+
+
+				-- If all completed, resolve with the final results list
+				if completed == count then resolve(results) end
+			end, function(reason)
+
+
+				-- If any promise rejects, reject entirely
+				reject(reason)
+			end)
+		end
 	end)
-
-
-	return deferred
 end
 
 
--- Return a table with the constructor functions 
+-- Takes an iterable of promises as input and returns a single Promise. This returned promise fulfills when all of the input's promises settle
+local function AllSettled(iterable: {Promise})
+	return CreatePromise(function(resolve:({{success: boolean, value: any} | {success: boolean, reason: any}})->())
+
+
+		-- Pre count the number of promises passed
+		local count = #iterable
+
+
+		-- If empty iterable, resolve with empty list immediately
+		if count == 0 then
+			resolve({})
+			return
+		end
+
+
+		-- Create result table and count completed
+		local results = table.create(count) :: {{success: boolean, value: any} | {success: boolean, reason: any}}
+		local completed = 0
+
+
+		-- For each promise passed, save the result and reason in correct order of receiving and resolve when all promises are complete
+		for index, promise in iterable do
+			promise.AndThen(function(value)
+				results[index] = {success = true, value = value}
+				completed += 1
+				if completed == count then resolve(results) end
+			end, function(reason)
+				results[index] = {success = false, reason = reason}
+				completed += 1
+				if completed == count then resolve(results) end
+			end)
+		end
+	end)
+end
+
+
+-- Takes an iterable of promises as input and returns a single Promise. This returned promise settles with the eventual state of the first promise that settles.
+local function Race(iterable: {Promise})
+	return CreatePromise(function(resolve: (any) -> (), reject: (any) -> ())
+		for _, promise in iterable do
+			promise.AndThen(resolve, reject)
+		end
+	end)
+end
+
+
+-- Takes an iterable of promises as input and returns a single Promise. This returned promise fulfills when any of the input's promises fulfills, with this first fulfillment value. It rejects when all of the input's promises reject
+local function Any(iterable: {Promise})
+	return CreatePromise(function(resolve, reject: ({any})->())
+
+
+		-- Pre count the number of promises passed
+		local count = #iterable
+		if count == 0 then
+			reject({})
+			return
+		end
+
+
+		-- Store errors in case everyone rejects
+		local errors = table.create(count)
+		local rejected = 0
+
+
+		-- For each promise passed, save the reason in correct order of receiving and reject when all promises are complete or resolve on first promise fulfill
+		for index, promise in iterable do
+			promise.AndThen(resolve, function(reason)
+				errors[index] = reason
+				rejected += 1
+
+
+				-- If everyone rejected, reject the entire promise with al the errors
+				if rejected == count then reject(errors) end
+			end)
+		end
+	end)
+end
+
+
+-- Return all promise constructor methods
 return table.freeze({
-	New = NewPromise,
-	Deferred = NewDeferred
+	Promise = CreatePromise,
+	Deferred = CreateDeferred,
+	Promisify = Promisify,
+	All = All,
+	AllSettled = AllSettled,
+	Race = Race,
+	Any = Any
 })
